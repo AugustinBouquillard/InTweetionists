@@ -1,10 +1,10 @@
-from sentence_transformers import SentenceTransformer
+"""from sentence_transformers import SentenceTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 import numpy as np
 import pandas as pd
 
-"""# Load tiny model
+# Load tiny model
 model = SentenceTransformer("sentence-transformers/paraphrase-albert-small-v2")
 
 # Prepare your data
@@ -81,7 +81,7 @@ kaggle_data["full_text"] = kaggle_data.apply(extract_full_text, axis=1)
 raw_train_dataset = Dataset.from_pandas(train_data[["full_text", "label"]])
 raw_kaggle_dataset = Dataset.from_pandas(kaggle_data[["full_text"]])
 
-# Convert integer labels → ClassLabel so stratification works
+# Convert integer labels → ClassLabel (for stratification)
 from datasets import ClassLabel
 class_label = ClassLabel(num_classes=2, names=["observer", "influencer"])
 raw_train_dataset = raw_train_dataset.cast_column("label", class_label)
@@ -93,7 +93,7 @@ raw_split = raw_train_dataset.train_test_split(
 )
 
 raw_train_dataset = raw_split["train"]
-raw_val_dataset = raw_split["test"]
+raw_val_dataset   = raw_split["test"]
 
 
 # ================================================
@@ -126,7 +126,6 @@ ds_val.set_format("torch")
 def compute_metrics(pred):
     labels = pred.label_ids
     preds = np.argmax(pred.predictions, axis=1)
-
     return {
         "accuracy": accuracy_score(labels, preds),
         "f1": f1_score(labels, preds, average="weighted")
@@ -134,7 +133,7 @@ def compute_metrics(pred):
 
 
 # ================================================
-# 6. TRAIN MINILM (APPLE SILICON FRIENDLY)
+# 6. TRAIN MINILM (COLAB GPU-OPTIMIZED)
 # ================================================
 model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
 
@@ -142,23 +141,23 @@ training_args = TrainingArguments(
     output_dir="minilm_final",
     report_to="none",
     learning_rate=3e-5,
-    per_device_train_batch_size=16,
+    per_device_train_batch_size=32,   # larger batch fits on GPU
     per_device_eval_batch_size=64,
     num_train_epochs=3,
     weight_decay=0.01,
     logging_dir="./logs_minilm",
 
-    # Apple Silicon safe settings
-    fp16=False,
-    bf16=False,     # ❌ disable bf16
-    no_cuda=True,   # ensures no CUDA is expected
+    # 🚀 GPU acceleration
+    fp16=True,          # fastest on T4/V100/A100
+    bf16=False,         # NVIDIA fp16 preferred
+    no_cuda=False,      # ensures GPU is used
+    torch_compile=True, # PyTorch 2.0 speed boost
 
     save_total_limit=1,
     eval_strategy="epoch",
     logging_strategy="steps",
-    logging_steps=200,
+    logging_steps=100,
 )
-
 
 trainer = Trainer(
     model=model,
@@ -169,7 +168,7 @@ trainer = Trainer(
     compute_metrics=compute_metrics,
 )
 
-print("🚀 Starting MiniLM training...")
+print("🚀 Starting MiniLM training on GPU...")
 trainer.train()
 print("✅ Training finished.")
 
@@ -202,5 +201,3 @@ submission = pd.DataFrame({
 
 submission.to_csv("submission.csv", index=False)
 print("📄 Saved submission.csv")
-
-
