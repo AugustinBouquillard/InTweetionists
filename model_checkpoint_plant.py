@@ -28,9 +28,11 @@ print("Validation accuracy:", acc)"""
 
 
 # ================================================
-# 0. IMPORTS
+# 0. IMPORTS & GPU CHECK
 # ================================================
+import os
 import json
+import numpy as np
 import pandas as pd
 from pandas import json_normalize
 from datasets import Dataset
@@ -38,86 +40,91 @@ from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
     Trainer,
-    TrainingArguments
+    TrainingArguments,
+    DataCollatorWithPadding,
+    EarlyStoppingCallback
 )
-
+from peft import get_peft_model, LoraConfig, TaskType
 from sklearn.metrics import accuracy_score, f1_score
-import numpy as np
+import torch
+
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU device:", torch.cuda.get_device_name(0))
+else:
+    raise SystemError("GPU NOT detected. In Colab, go to Runtime → Change Runtime Type → GPU.")
+
+device = torch.device("cuda")
 
 
 # ================================================
-# 1. LOAD + CLEAN JSONL DATA
+# 1. LOAD JSONL DATA
 # ================================================
 def load_jsonl(path):
-    data_list = []
+    rows = []
     with open(path, "r") as f:
         for line in f:
             try:
-                data_list.append(json.loads(line))
-            except json.JSONDecodeError as e:
-                print("JSON error:", e)
-    return json_normalize(data_list)
-
+                rows.append(json.loads(line))
+            except:
+                pass
+    return json_normalize(rows)
 
 train_data = load_jsonl("train.jsonl")
 kaggle_data = load_jsonl("kaggle_test.jsonl")
 
+print("Train rows:", len(train_data))
+print("Kaggle rows:", len(kaggle_data))
+
 
 # ================================================
-# 2. EXTRACT FULL TEXT (EXTENDED TWEETS)
+# 2. EXTRACT FULL TEXT
 # ================================================
 def extract_full_text(row):
     if "extended_tweet.full_text" in row and not pd.isna(row["extended_tweet.full_text"]):
         return row["extended_tweet.full_text"]
     return row.get("text", "")
 
-train_data["full_text"] = train_data.apply(extract_full_text, axis=1)
+train_data["full_text"]  = train_data.apply(extract_full_text, axis=1)
 kaggle_data["full_text"] = kaggle_data.apply(extract_full_text, axis=1)
 
 
-# ============================================================
-# 3. BUILD HUGGINGFACE DATASETS
-# ============================================================
-raw_train_dataset = Dataset.from_pandas(train_data[["full_text", "label"]])
-raw_kaggle_dataset = Dataset.from_pandas(kaggle_data[["full_text"]])
+# ================================================
+# 3. BUILD HF DATASETS
+# ================================================
+raw_train = Dataset.from_pandas(train_data[["full_text", "label"]])
+raw_test  = Dataset.from_pandas(kaggle_data[["full_text"]])
 
-# Convert integer labels → ClassLabel (for stratification)
 from datasets import ClassLabel
-class_label = ClassLabel(num_classes=2, names=["observer", "influencer"])
-raw_train_dataset = raw_train_dataset.cast_column("label", class_label)
+labels = ClassLabel(num_classes=2, names=["observer", "influencer"])
+raw_train = raw_train.cast_column("label", labels)
 
-# Stratified train/val split
-raw_split = raw_train_dataset.train_test_split(
-    test_size=0.1,
-    stratify_by_column="label"
-)
+split = raw_train.train_test_split(test_size=0.1, stratify_by_column="label")
+ds_train = split["train"]
+ds_val   = split["test"]
 
-raw_train_dataset = raw_split["train"]
-raw_val_dataset   = raw_split["test"]
+print("Train:", len(ds_train), " Val:", len(ds_val))
 
 
 # ================================================
-# 4. TOKENIZATION
+# 4. TOKENIZATION (Dynamic padding)
 # ================================================
-model_name = "nreimers/MiniLM-L6-H384-uncased"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+MODEL_NAME = "nreimers/MiniLM-L6-H384-uncased"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-def tokenize_fn(batch):
-    return tokenizer(
-        batch["full_text"],
-        truncation=True,
-        padding="max_length",
-        max_length=128,
-    )
+def tokenize(batch):
+    return tokenizer(batch["full_text"], truncation=True, max_length=128)
 
-ds_train = raw_train_dataset.map(tokenize_fn, batched=True, load_from_cache_file=False)
-ds_val   = raw_val_dataset.map(tokenize_fn, batched=True, load_from_cache_file=False)
+ds_train = ds_train.map(tokenize, batched=True)
+ds_val   = ds_val.map(tokenize, batched=True)
+ds_test  = raw_test.map(tokenize, batched=True)
 
-# Trainer expects "labels"
 ds_train = ds_train.rename_column("label", "labels")
-
 ds_train.set_format("torch")
 ds_val.set_format("torch")
+ds_test.set_format("torch")
+
+collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
 
 # ================================================
@@ -125,7 +132,7 @@ ds_val.set_format("torch")
 # ================================================
 def compute_metrics(pred):
     labels = pred.label_ids
-    preds = np.argmax(pred.predictions, axis=1)
+    preds = pred.predictions.argmax(axis=1)
     return {
         "accuracy": accuracy_score(labels, preds),
         "f1": f1_score(labels, preds, average="weighted")
@@ -133,30 +140,44 @@ def compute_metrics(pred):
 
 
 # ================================================
-# 6. TRAIN MINILM (COLAB GPU-OPTIMIZED)
+# 6. LOAD BASE MODEL + LoRA
 # ================================================
-model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME, 
+    num_labels=2
+)
 
+# LoRA config optimized for MiniLM
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=32,
+    target_modules=["query", "key", "value", "dense"],  # works for MiniLM
+    lora_dropout=0.05,
+    task_type=TaskType.SEQ_CLS
+)
+
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+
+
+# ================================================
+# 7. TRAINING ARGS (GPU + FP16 + EARLY STOPPING)
+# ================================================
 training_args = TrainingArguments(
-    output_dir="minilm_final",
-    report_to="none",
-    learning_rate=3e-5,
-    per_device_train_batch_size=32,   # larger batch fits on GPU
+    output_dir="lora_minilm_out",
+    learning_rate=2e-4,
+    per_device_train_batch_size=32,
     per_device_eval_batch_size=64,
-    num_train_epochs=3,
-    weight_decay=0.01,
-    logging_dir="./logs_minilm",
-
-    # 🚀 GPU acceleration
-    fp16=True,          # fastest on T4/V100/A100
-    bf16=False,         # NVIDIA fp16 preferred
-    no_cuda=False,      # ensures GPU is used
-    torch_compile=True, # PyTorch 2.0 speed boost
-
-    save_total_limit=1,
+    num_train_epochs=5,                     # early stopping will stop earlier
     eval_strategy="epoch",
-    logging_strategy="steps",
-    logging_steps=100,
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    metric_for_best_model="f1",
+    greater_is_better=True,
+
+    fp16=True,                              # use GPU fast path
+    dataloader_num_workers=4,
+    report_to="none",
 )
 
 trainer = Trainer(
@@ -165,39 +186,41 @@ trainer = Trainer(
     train_dataset=ds_train,
     eval_dataset=ds_val,
     tokenizer=tokenizer,
+    data_collator=collator,
     compute_metrics=compute_metrics,
+    callbacks=[EarlyStoppingCallback(
+        early_stopping_patience=2,          # stops if 2 consecutive epochs have no improvement
+        early_stopping_threshold=0.0001
+    )]
 )
 
-print("🚀 Starting MiniLM training on GPU...")
+
+# ================================================
+# 8. TRAIN
+# ================================================
+print("🚀 Training with LoRA on GPU...")
 trainer.train()
-print("✅ Training finished.")
+print("✅ Training complete!")
 
 
 # ================================================
-# 7. SAVE TRAINED MODEL
+# 9. SAVE PEFT ADAPTER
 # ================================================
-trainer.save_model("minilm_final")
-tokenizer.save_pretrained("minilm_final")
-print("📦 Model saved in minilm_final/")
+model.save_pretrained("minilm_lora_adapter")
+tokenizer.save_pretrained("minilm_lora_adapter")
+print("📦 Saved LoRA adapter → minilm_lora_adapter/")
 
 
 # ================================================
-# 8. GENERATE KAGGLE PREDICTIONS
+# 10. PREDICT TEST SET
 # ================================================
-ds_kaggle = raw_kaggle_dataset.map(
-    tokenize_fn,
-    batched=True,
-    load_from_cache_file=False
-)
-ds_kaggle.set_format("torch")
-
-preds = trainer.predict(ds_kaggle).predictions
-pred_labels = preds.argmax(axis=1)
+preds = trainer.predict(ds_test).predictions
+labels = preds.argmax(axis=1)
 
 submission = pd.DataFrame({
-    "id": kaggle_data["id"],
-    "label": pred_labels
+    "ID": kaggle_data["challenge_id"],
+    "Prediction": labels
 })
-
 submission.to_csv("submission.csv", index=False)
+
 print("📄 Saved submission.csv")
