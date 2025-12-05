@@ -4,3 +4,4 @@ kaggle_test.jsonl
 .venv
 *.pth
 model_weights*
+*.csv
